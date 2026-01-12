@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # KABS Quotation and Drawing System
 
 A modern web application for kitchen cabinet quotation and AI-powered drawing analysis.
@@ -69,3 +70,6 @@ npm run preview
 ## License
 
 Private - All rights reserved
+=======
+# KABS-Quotation-Design-AI
+>>>>>>> 5eb92c0273bcb8f5869d0c782a2ea5f18ecf2735
