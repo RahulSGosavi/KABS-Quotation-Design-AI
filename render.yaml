@@ -5,7 +5,7 @@ services:
     region: oregon
     plan: free
     buildCommand: npm install && npm run build
-    startCommand: npm run preview -- --port $PORT
+    startCommand: npm start
     envVars:
       - key: NODE_ENV
         value: production
