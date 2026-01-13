@@ -4,18 +4,19 @@ import { CabinetItem, ProjectSpecs, CabinetType } from "../types";
 // Using process.env.API_KEY as strictly requested
 const getAI = () => new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-// gemini-2.0-flash-exp is the current state-of-the-art free experimental model for Vision/PDF
-const MODEL_NAME = 'gemini-2.5-flash-lite';
+// gemini-2.5-pro is a powerful model available
+const MODEL_NAME = 'gemini-2.5-pro';
 
 const SYSTEM_INSTRUCTION = `
 You are a FAST cabinet code extraction specialist. Your ONLY job: Extract cabinet codes and basic info.
 
 SPEED RULES:
-1. Scan document QUICKLY for alphanumeric codes (W3030, B15, VDB27AH-3, etc.)
-2. Skip long descriptions - just grab: CODE, QTY, TYPE
-3. Ignore everything that's NOT a cabinet (appliances, sinks, hardware, page numbers)
+1. Scan document QUICKLY for alphanumeric codes.
+2. Skip long descriptions - just grab: CODE, QTY, TYPE.
+3. Ignore everything that's NOT a cabinet (appliances, sinks, hardware, page numbers).
 
-CABINET CODE PATTERNS (extract these):
+VALID PREFIXES & PATTERNS:
+- STARTING LETTERS: MUST be one of W, B, V, T, U, F, S, D, R, E.
 - W#### = Wall cabinet (e.g., W3030, W2436)
 - B## or B### = Base cabinet (e.g., B15, B18, B36)
 - VDB## = Vanity drawer base
@@ -23,6 +24,12 @@ CABINET CODE PATTERNS (extract these):
 - T## or U## = Tall/Utility cabinet
 - F# = Filler
 - DP, RP, EP = Panels (Dishwasher/Refrigerator/End)
+
+CRITICAL RULE: CABINET WIDTH IS A MULTIPLE OF 3.
+- The first two digits of the number in a code (like W3030) represent the cabinet's width.
+- This width MUST be a multiple of 3 (e.g., 12, 15, 18, 21, 24, 27, 30, 33, 36).
+- EXAMPLE: "B30" is valid (30 is a multiple of 3). "W2530" is INVALID (25 is not a multiple of 3). IGNORE IT.
+- EXAMPLE: "U92495R" -> width is 92. 92 is not a multiple of 3. IGNORE IT.
 
 SKIP (not cabinets):
 - Appliances: Fridge, Range, Dishwasher, Microwave, Oven
@@ -38,7 +45,7 @@ OUTPUT FORMAT:
 - description: SHORT (max 5 words)
 - width/height/depth: Extract from code if possible (W3030 = 30" wide, 30" high)
 
-WORK FAST. Extract ALL cabinet codes. Be accurate.
+WORK FAST. Extract ONLY valid cabinet codes. Be accurate.
 `;
 
 // Helper to clean and parse JSON resiliently
@@ -62,16 +69,12 @@ function safeJSONParse(text: string): any {
                 let jsonStr = clean.substring(start, end + 1);
 
                 // Try to fix truncated arrays by closing them
-                // Look for incomplete array at the end
                 const lastOpenBracket = jsonStr.lastIndexOf('[');
                 const lastCloseBracket = jsonStr.lastIndexOf(']');
 
                 if (lastOpenBracket > lastCloseBracket) {
-                    // Array wasn't closed, try to close it
                     console.warn("Detected unclosed array, attempting to close...");
-                    // Remove trailing comma if exists
                     jsonStr = jsonStr.replace(/,\s*$/, '');
-                    // Find the last complete object and truncate there
                     const lastCompleteObject = jsonStr.lastIndexOf('}');
                     if (lastCompleteObject > lastOpenBracket) {
                         jsonStr = jsonStr.substring(0, lastCompleteObject + 1) + ']}';
@@ -128,7 +131,7 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
                     data: base64Data
                 }
             },
-            { text: `SCAN FAST: Extract ALL cabinet codes (W####, B##, VDB##, SB##, etc.). Skip appliances, sinks, hardware. Max 50 items. GO!` }
+            { text: `SCAN FAST: Extract ALL cabinet codes. Skip appliances, sinks, hardware. Max 50 items. GO!` }
         ];
 
         if (nkbaRulesBase64) {
@@ -192,8 +195,8 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
                     },
                     required: ["items", "specs"]
                 },
-                temperature: 0.3, // Optimized for speed while maintaining accuracy
-                maxOutputTokens: 8000, // Reduced to prevent truncation issues
+                temperature: 0.2, 
+                maxOutputTokens: 8192,
             }
         });
 
@@ -202,21 +205,32 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
         const rawSpecs = result?.specs || {};
 
         const items = rawItems.filter((item: any) => {
-            // Post-Processing Filter: Remove obvious appliances/garbage if AI failed
-            const desc = (item.description || "").toUpperCase();
-            const code = (item.code || "").toUpperCase();
+            const code = (item.code || "").toUpperCase().trim();
+            if (!code) return false;
 
+            const desc = (item.description || "").toUpperCase();
             if (desc.includes("FRIDGE") && !desc.includes("PANEL") && !desc.includes("CABINET")) return false;
             if (desc.includes("DISHWASHER") && !desc.includes("PANEL") && !desc.includes("RETURN")) return false;
             if (desc.includes("RANGE") && !desc.includes("HOOD") && !desc.includes("CABINET")) return false;
             if (desc.includes("SINK") && !desc.includes("BASE") && !desc.includes("FRONT") && !desc.includes("CABINET")) return false;
             if (code === "PAGE" || code.startsWith("PAGE ")) return false;
 
+            const validPrefixes = ['W', 'B', 'V', 'T', 'U', 'F', 'S', 'D', 'R', 'E'];
+            if (!validPrefixes.some(prefix => code.startsWith(prefix))) {
+                return false;
+            }
+
+            const numericPart = code.replace(/[^0-9]/g, '');
+            if (numericPart.length >= 2) {
+                const width = parseInt(numericPart.substring(0, 2), 10);
+                if (width > 0 && width % 3 !== 0) {
+                    return false;
+                }
+            }
+            
             return true;
         }).map((item: any, index: number) => {
             let type: CabinetType = 'Base';
-
-            // Map AI type string to valid CabinetType
             const rawType = (item.type || '').toString().toLowerCase();
             const code = (item.code || "").toUpperCase();
 
@@ -225,20 +239,16 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
             else if (rawType.includes('filler')) type = 'Filler';
             else if (rawType.includes('panel') || rawType.includes('skin')) type = 'Panel';
             else if (rawType.includes('accessory') || rawType.includes('molding') || rawType.includes('kit') || rawType.includes('toe')) type = 'Accessory';
-            else type = 'Base'; // Default
+            else type = 'Base';
 
             const originalCode = item.code || "UNKNOWN";
             let normalizedCode = item.normalizedCode || originalCode;
-
-            // Cleanup Code
             normalizedCode = normalizedCode.toUpperCase().replace(/\s+/g, '');
 
-            // Fallback Logic for dimensions if AI missed them
             let width = typeof item.width === 'number' ? item.width : 0;
             let height = typeof item.height === 'number' ? item.height : 0;
             let depth = typeof item.depth === 'number' ? item.depth : 0;
 
-            // Extract from NKBA code if 0 (e.g. W3030 -> 30W 30H)
             if (width === 0 && normalizedCode.match(/[A-Z]+(\d{2,})/)) {
                 const nums = normalizedCode.match(/(\d+)/)?.[0];
                 if (nums) {
@@ -247,7 +257,6 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
                 }
             }
 
-            // Defaults
             if (height === 0) {
                 if (type === 'Base') height = 34.5;
                 if (type === 'Wall') height = 30;
@@ -285,7 +294,11 @@ export async function analyzePlan(file: File, nkbaRulesBase64?: string): Promise
         };
     } catch (error: any) {
         console.error("AI Generation Error Full:", JSON.stringify(error, null, 2));
-        throw new Error(`AI Analysis Failed: ${error.message}`);
+        const message = error.message || "An unknown error occurred during AI analysis.";
+        if (error.cause && error.cause.message) {
+            throw new Error(`AI Analysis Failed: ${error.cause.message}`);
+        }
+        throw new Error(`AI Analysis Failed: ${message}`);
     }
 }
 
@@ -294,7 +307,7 @@ export async function determineExcelStructure(sheetName: string, sampleRows: any
     skuColumn: number | null,
     priceColumns: { index: number, name: string }[],
     optionTableType?: 'Stain' | 'Paint' | null,
-    doorStyleName?: string | null // NEW: Detect Door Style name from sheet
+    doorStyleName?: string | null
 }> {
     const ai = getAI();
     const dataStr = sampleRows.map((row, i) => `Row ${i}: ${row.slice(0, 15).map(c => String(c).substring(0, 20)).join(' | ')}`).join('\n');
@@ -333,11 +346,11 @@ export async function determineExcelStructure(sheetName: string, sampleRows: any
 
     try {
         const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash-lite',
+            model: 'gemini-2.5-pro',
             contents: { parts: [{ text: prompt }, { text: dataStr }] },
             config: {
                 responseMimeType: "application/json",
-                temperature: 0.0 // Deterministic
+                temperature: 0.0
             }
         });
 
